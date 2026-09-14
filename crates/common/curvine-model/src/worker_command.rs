@@ -64,6 +64,7 @@ impl BlockReportInfo {
 pub struct BlockReportList {
     pub cluster_id: String,
     pub worker_id: u32,
+    pub worker_session_id: String,
     pub full_report: bool,
     pub total_len: u64,
     pub blocks: Vec<BlockReportInfo>,

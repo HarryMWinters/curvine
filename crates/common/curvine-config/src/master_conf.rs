@@ -76,6 +76,9 @@ pub struct MasterConf {
     #[serde(skip)]
     pub worker_blacklist_interval_unit: DurationUnit,
 
+    // Missing-heartbeat timeout, and metadata retention after an explicit End
+    // or restart. A returning worker must reconcile its full block inventory
+    // before Running cancels pending cleanup. Timeout loss adds no second grace.
     pub worker_lost_interval: String,
     #[serde(skip)]
     pub worker_lost_interval_unit: DurationUnit,

@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
 use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
 use curvine_io::DataSlice;
-use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
+use curvine_model::{AccessMode, HeartbeatStatus, MountOptionsBuilder, WriteType};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_server::worker::block::MasterClient;
 use curvine_tests::Testing;
 use std::env;
 use std::sync::Arc;
@@ -87,15 +90,25 @@ fn test_cache_mode() {
 
 #[test]
 fn test_cache_mode_recaches_after_lost_worker_cleanup() {
+    test_cache_mode_recaches_after_worker_removal(false);
+}
+
+#[test]
+fn test_cache_mode_recaches_after_worker_end() {
+    test_cache_mode_recaches_after_worker_removal(true);
+}
+
+fn test_cache_mode_recaches_after_worker_removal(graceful_end: bool) {
     let testing = Testing::builder()
         .workers(2)
         // The first worker remains alive in this in-process test, but the
-        // master treats it as lost. The next heartbeat leaves enough time for
-        // the cache reload while still allowing the mini-cluster to start.
-        .mutate_conf(|conf| {
-            conf.master.heartbeat_interval = "10s".to_string();
-            conf.master.worker_blacklist_interval = "20s".to_string();
-            conf.master.worker_lost_interval = "30s".to_string();
+        // master treats it as lost. Synchronizing with a fresh heartbeat below
+        // leaves time for the cache reload before the worker re-registers.
+        .mutate_conf(move |conf| {
+            conf.master.heartbeat_interval = if graceful_end { "200ms" } else { "10s" }.into();
+            conf.master.worker_check_interval = "100ms".to_string();
+            conf.master.worker_blacklist_interval = if graceful_end { "1s" } else { "20s" }.into();
+            conf.master.worker_lost_interval = if graceful_end { "3s" } else { "30s" }.into();
         })
         .build()
         .unwrap();
@@ -105,8 +118,13 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
     let rt = Arc::new(AsyncRuntime::single());
     let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
 
-    rt.block_on(async move {
-        let mount_dir = "cache_mode_lost_worker_recache";
+    // Keep the cluster's runtime owners outside the async context at teardown.
+    rt.block_on(async {
+        let mount_dir = if graceful_end {
+            "cache_mode_worker_end_recache"
+        } else {
+            "cache_mode_lost_worker_recache"
+        };
         let cv_path = Path::from_str(format!("/{mount_dir}/data.log")).unwrap();
         let ufs_path = Path::from_str(format!("{ufs_base}/{mount_dir}")).unwrap();
         let opts = MountOptionsBuilder::new()
@@ -149,15 +167,90 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
         assert_eq!(cached.block_locs[0].locs.len(), 1);
         let lost_worker_id = cached.block_locs[0].locs[0].worker_id;
 
-        // Match HeartbeatChecker's lost-worker sequence: remove the worker
-        // from placement, then clear its block locations at the master.
+        // Startup and the initial cache load can consume most of a heartbeat
+        // interval. Wait for a real heartbeat before simulating either removal
+        // path so the live worker's next heartbeat cannot race the assertions.
+        let last_heartbeat = master
+            .worker_manager
+            .read()
+            .get_worker(lost_worker_id)
+            .unwrap()
+            .last_update;
+        let mut heartbeat = awaitility::at_most(Duration::from_secs(15));
+        heartbeat.poll_interval(Duration::from_millis(20));
+        heartbeat
+            .until_async(|| async {
+                master
+                    .worker_manager
+                    .read()
+                    .get_worker(lost_worker_id)
+                    .map(|worker| worker.last_update > last_heartbeat)
+                    .unwrap_or(false)
+            })
+            .await;
+        heartbeat
+            .result()
+            .expect("worker should send a fresh heartbeat before simulated removal");
+
+        if graceful_end {
+            let lost_worker = master
+                .worker_manager
+                .read()
+                .get_worker(lost_worker_id)
+                .unwrap()
+                .clone();
+            let client = MasterClient::new(
+                fs.cv().fs_context(),
+                cluster.cluster_conf.cluster_id.clone(),
+                lost_worker_id,
+                lost_worker.address,
+                lost_worker.weight,
+                lost_worker.worker_session_id,
+                lost_worker.startup_time_ms,
+            );
+            // Exercise the real shutdown RPC and background cleanup, without
+            // manually removing the worker or deleting its block locations.
+            tokio::task::spawn_blocking(move || client.heartbeat(HeartbeatStatus::End, vec![]))
+                .await
+                .unwrap()
+                .unwrap();
+
+            // The cache metadata survives the grace window, but reads must
+            // continue through UFS while the only cached replica is offline.
+            assert!(fs.cv().get_status(&cv_path).await.unwrap().cv_valid(None));
+            let mut during_grace = fs.open(&cv_path).await.unwrap();
+            assert_eq!(during_grace.read_as_string().await.unwrap(), data);
+
+            let mut invalidation = awaitility::at_most(Duration::from_secs(6));
+            invalidation.poll_interval(Duration::from_millis(20));
+            invalidation
+                .until_async(|| async {
+                    fs.cv()
+                        .get_status(&cv_path)
+                        .await
+                        .map(|status| !status.cv_valid(None))
+                        .unwrap_or(false)
+                })
+                .await;
+            invalidation
+                .result()
+                .expect("unreadable cache should be invalidated after the End grace period");
+        } else {
+            // Preserve the original timeout-cleanup regression from #1526.
+            assert!(master
+                .worker_manager
+                .write()
+                .remove_expired_worker(lost_worker_id)
+                .is_some());
+            let cleanup = master.delete_locations(lost_worker_id).unwrap();
+            assert!(cleanup.replication_block_ids.is_empty());
+        }
+
         assert!(master
             .worker_manager
-            .write()
-            .remove_expired_worker(lost_worker_id)
-            .is_some());
-        let cleanup = master.delete_locations(lost_worker_id).unwrap();
-        assert!(cleanup.replication_block_ids.is_empty());
+            .read()
+            .get_worker(lost_worker_id)
+            .is_none());
 
         let invalidated = fs.cv().get_status(&cv_path).await.unwrap();
         assert!(!invalidated.cv_valid(None));
@@ -174,6 +267,23 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
         let mut reloaded_hit = fs.open(&cv_path).await.unwrap();
         assert!(matches!(reloaded_hit, UnifiedReader::Fallback(_)));
         assert_eq!(reloaded_hit.read_as_string().await.unwrap(), data);
+
+        let reloaded = fs.cv().get_block_locations(&cv_path).await.unwrap();
+        assert_eq!(reloaded.block_locs.len(), 1);
+        assert_eq!(reloaded.block_locs[0].locs.len(), 1);
+        assert_ne!(
+            reloaded.block_locs[0].block.id,
+            cached.block_locs[0].block.id
+        );
+        assert_ne!(reloaded.block_locs[0].locs[0].worker_id, lost_worker_id);
+        assert!(
+            master
+                .worker_manager
+                .read()
+                .get_worker(lost_worker_id)
+                .is_none(),
+            "recache must complete before the simulated lost worker re-registers"
+        );
     });
 }
 

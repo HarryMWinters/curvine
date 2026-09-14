@@ -736,14 +736,42 @@ impl MasterHandler {
     ) -> FsResult<Vec<WorkerCommand>> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
+        let lifecycle = fs.worker_lifecycle_lock(address.worker_id);
+        let _lifecycle = lifecycle.lock();
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
-        if matches!(status, HeartbeatStatus::Start) {
-            fs.reset_full_block_report(address.worker_id);
+        let startup_time_ms = u64::try_from(header.fs_ctime).unwrap_or_default();
+        let can_resume = matches!(status, HeartbeatStatus::Running) && {
+            let wm = fs.worker_manager.read();
+            header.cluster_id == wm.cluster_id
+                && wm.accepts_running_heartbeat(
+                    &address,
+                    header.worker_session_id.as_deref().unwrap_or_default(),
+                    startup_time_ms,
+                )
+        };
+        if can_resume && fs.has_pending_worker_cleanup(address.worker_id) {
+            // Keep the checker responsible for completing invalidation and
+            // forwarding replication work before registration cancels its retry.
+            return err_box!("Worker {} cleanup is pending; retry heartbeat", address);
         }
-
         let mut wm = fs.worker_manager.write();
+        if matches!(status, HeartbeatStatus::Start) {
+            wm.validate_worker_start(
+                &header.cluster_id,
+                &address,
+                header.worker_session_id.as_deref().unwrap_or_default(),
+                startup_time_ms,
+            )?;
+            if !wm.is_duplicate_worker_start(
+                &address,
+                header.worker_session_id.as_deref().unwrap_or_default(),
+                startup_time_ms,
+            ) {
+                fs.reset_full_block_report(address.worker_id);
+            }
+        }
         let cmds = wm.heartbeat(
             &header.cluster_id,
             status,
@@ -758,7 +786,7 @@ impl MasterHandler {
                 source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
             },
             header.software_version,
-            u64::try_from(header.fs_ctime).unwrap_or_default(),
+            startup_time_ms,
             ProtoUtils::storage_info_list_from_pb(header.storages),
             header.component_info,
         )?;
@@ -1184,8 +1212,1358 @@ impl MessageHandler for MasterHandler {
 mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
-    use curvine_model::WorkerAddress;
+    use curvine_model::{
+        BlockLocation, ClientAddress, CommitBlock, CreateFileOptsBuilder, LocatedBlock, OpenFlags,
+        SetAttrOptsBuilder, StorageInfo, TtlAction, WorkerAddress,
+    };
     use curvine_runtime::common::Utils;
+
+    fn offline_worker_fs() -> (MasterFilesystem, WorkerHeartbeatRequest) {
+        offline_worker_fs_with_id(7)
+    }
+
+    fn offline_worker_fs_with_id(worker_id: u32) -> (MasterFilesystem, WorkerHeartbeatRequest) {
+        Master::init_test_metrics();
+        let name = Utils::rand_str(10);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("offline-worker/meta-{name}"));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!("offline-worker/journal-{name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id,
+            hostname: "offline-worker".into(),
+            ip_addr: "127.0.0.1".into(),
+            rpc_port: 1234,
+            web_port: 5678,
+        };
+        let header = WorkerHeartbeatRequest {
+            cluster_id: conf.cluster_id,
+            worker_id: address.worker_id,
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("original-session".into()),
+            fs_ctime: 123_456,
+            storages: vec![ProtoUtils::storage_info_to_pb(StorageInfo {
+                capacity: 1 << 40,
+                available: 1 << 40,
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        offline_heartbeat(&fs, &header, HeartbeatStatus::Running);
+        (fs, header)
+    }
+
+    fn offline_heartbeat(
+        fs: &MasterFilesystem,
+        header: &WorkerHeartbeatRequest,
+        status: HeartbeatStatus,
+    ) {
+        let mut header = header.clone();
+        header.status = status.into();
+        MasterHandler::process_worker_heartbeat(fs.clone(), header).unwrap();
+    }
+
+    fn offline_cache_file(
+        fs: &MasterFilesystem,
+        path: &str,
+        ttl_action: TtlAction,
+        ufs_backed: bool,
+    ) -> (FileStatus, LocatedBlock) {
+        let client = ClientAddress::default();
+        let status = fs
+            .create_with_opts(
+                path,
+                CreateFileOptsBuilder::new().ttl_action(ttl_action).build(),
+                OpenFlags::new_create(),
+            )
+            .unwrap();
+        let block = fs
+            .add_block(path, None, client.clone(), vec![], vec![], 0, None)
+            .unwrap();
+        fs.complete_file(
+            path,
+            None,
+            status.block_size,
+            vec![CommitBlock {
+                block_id: block.block.id,
+                block_len: status.block_size,
+                locations: vec![BlockLocation::with_id(block.locs[0].worker_id)],
+            }],
+            &client.client_name,
+            false,
+            None,
+        )
+        .unwrap();
+        if ufs_backed {
+            fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(12_345).build())
+                .unwrap();
+        }
+        (fs.file_status(path).unwrap(), block)
+    }
+
+    fn offline_report_request(
+        header: &WorkerHeartbeatRequest,
+        full_report: bool,
+        blocks: &[(i64, i64)],
+    ) -> BlockReportListRequest {
+        BlockReportListRequest {
+            cluster_id: header.cluster_id.clone(),
+            worker_id: header.worker_id,
+            worker_session_id: header.worker_session_id.clone(),
+            full_report,
+            total_len: blocks.len() as u64,
+            blocks: blocks
+                .iter()
+                .map(|&(id, block_size)| BlockReportInfoProto {
+                    id,
+                    status: curvine_model::BlockReportStatus::Finalized.into(),
+                    block_size,
+                    storage_type: curvine_model::StorageType::Disk.into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn offline_report(
+        fs: &MasterFilesystem,
+        header: &WorkerHeartbeatRequest,
+        full_report: bool,
+        blocks: &[(i64, i64)],
+    ) -> Vec<i64> {
+        let report = offline_report_request(header, full_report, blocks);
+        MasterHandler::process_block_report(fs.clone(), None, report)
+            .unwrap()
+            .into_iter()
+            .flat_map(|command| match command {
+                WorkerCommand::DeleteBlock(command) => command.blocks,
+            })
+            .collect()
+    }
+
+    fn offline_wait_for_reconcile(mut completed: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !completed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "full block report reconciliation did not complete within five seconds"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn offline_wait_for_full_report(fs: &MasterFilesystem, header: &WorkerHeartbeatRequest) {
+        offline_wait_for_reconcile(|| {
+            fs.worker_manager.read().worker_block_report_complete(
+                header.worker_id,
+                header.worker_session_id.as_deref().unwrap_or_default(),
+            )
+        });
+    }
+
+    #[test]
+    fn offline_worker_restart_full_report_preserves_reported_cache() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/retained-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("retained-storage-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(block.block.id, before.block_size)],
+        )
+        .is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+
+        let retained = fs.get_block_locations(path).unwrap();
+        assert!(retained.status.cv_valid(None));
+        assert_eq!(
+            retained.status.storage_policy.state,
+            before.storage_policy.state
+        );
+        assert_eq!(retained.block_locs.len(), 1);
+        assert_eq!(retained.block_locs[0].block.id, block.block.id);
+        assert_eq!(retained.block_locs[0].locs.len(), 1);
+        assert_eq!(retained.block_locs[0].locs[0].worker_id, header.worker_id);
+    }
+
+    #[test]
+    fn offline_worker_expiry_after_full_report_deletes_cache_on_first_running() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/expired-before-running-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("reported-before-expiry-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(block.block.id, before.block_size)],
+        )
+        .is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        assert!(fs.file_status(path).unwrap().cv_valid(None));
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+
+        // A completed report does not cancel the deadline until the worker is
+        // ready. Expire the retained cache before its first Running heartbeat.
+        let expired = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(expired.len(), 1);
+        let cleanup = fs.delete_lost_worker_locations(&expired[0]).unwrap();
+        assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+        assert!(cleanup.replication_block_ids.is_empty());
+        assert!(!fs.file_status(path).unwrap().cv_valid(None));
+
+        restarted.status = HeartbeatStatus::Running.into();
+        let deleted: Vec<i64> = MasterHandler::process_worker_heartbeat(fs.clone(), restarted)
+            .unwrap()
+            .into_iter()
+            .flat_map(|command| match command {
+                WorkerCommand::DeleteBlock(command) => command.blocks,
+            })
+            .collect();
+        assert_eq!(deleted, vec![block.block.id]);
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_some());
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+        let after = fs.get_block_locations(path).unwrap();
+        assert!(!after.status.cv_valid(None));
+        assert!(after.status.ufs_exists());
+        assert_eq!(after.status.len, before.len);
+        assert_eq!(
+            after.status.storage_policy.ufs_mtime,
+            before.storage_policy.ufs_mtime
+        );
+        assert!(after.block_locs.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn offline_worker_running_waits_for_partial_timeout_cleanup_before_registering() {
+        use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+        struct RuleGuard(String);
+        impl Drop for RuleGuard {
+            fn drop(&mut self) {
+                let _ = FaultRuntime::process().remove(&self.0);
+            }
+        }
+
+        let (fs, mut header) = offline_worker_fs_with_id(92_001);
+        let path = "/partial-timeout-cleanup-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        let expired = fs
+            .worker_manager
+            .write()
+            .remove_expired_worker(header.worker_id)
+            .unwrap();
+        let rule_id = format!("partial-timeout-running-{}", header.worker_id);
+        let rule = FaultRuleBuilder::named("master.cache.before_invalidate_lost_chunk")
+            .matches("worker_id", header.worker_id)
+            .unwrap()
+            .times(1)
+            .unwrap()
+            .return_error("injected timeout invalidation failure")
+            .unwrap();
+        FaultRuntime::process().configure(&rule_id, rule).unwrap();
+        let _rule = RuleGuard(rule_id);
+        let failure = match fs.delete_lost_worker_locations(&expired) {
+            Ok(_) => panic!("expected injected timeout cleanup failure"),
+            Err(error) => error,
+        };
+        assert!(failure
+            .to_string()
+            .contains("injected timeout invalidation failure"));
+        assert!(fs.file_status(path).unwrap().cv_valid(None));
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+        fs.worker_manager.write().queue_offline_worker(expired);
+
+        // A worker recovering from a heartbeat timeout sends Running directly.
+        // Defer registration until the checker finishes its captured work, so
+        // the normal background path also handles any required replication.
+        header.status = HeartbeatStatus::Running.into();
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), header.clone()).is_err());
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+        assert!(fs.file_status(path).unwrap().cv_valid(None));
+        let pending = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(pending.len(), 1, "Running must preserve the cleanup retry");
+        let cleanup = fs.delete_lost_worker_locations(&pending[0]).unwrap();
+        assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+        assert!(cleanup.replication_block_ids.is_empty());
+
+        let commands = MasterHandler::process_worker_heartbeat(fs.clone(), header.clone()).unwrap();
+        assert!(commands.iter().any(|command| match command {
+            WorkerCommand::DeleteBlock(command) => command.blocks.contains(&block.block.id),
+        }));
+        let after = fs.get_block_locations(path).unwrap();
+        assert!(!after.status.cv_valid(None));
+        assert!(after.status.ufs_exists());
+        assert_eq!(after.status.len, before.len);
+        assert_eq!(
+            after.status.storage_policy.ufs_mtime,
+            before.storage_policy.ufs_mtime
+        );
+        assert!(after.block_locs.is_empty());
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(header.worker_id)
+                .unwrap()
+                .worker_session_id,
+            header.worker_session_id.unwrap()
+        );
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX)
+            .is_empty());
+    }
+
+    #[test]
+    fn offline_worker_cleanup_racing_rejoin_keeps_cache_and_locations_consistent() {
+        for iteration in 0..8 {
+            let (fs, header) = offline_worker_fs();
+            let path = "/concurrent-rejoin-cache";
+            let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+            offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+            let mut pending = fs
+                .worker_manager
+                .write()
+                .take_expired_offline_workers(u64::MAX);
+            assert_eq!(pending.len(), 1);
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let cleanup_barrier = barrier.clone();
+            let cleanup_fs = fs.clone();
+            let expired = pending.remove(0);
+            let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+            let cleanup_thread = std::thread::spawn(move || {
+                cleanup_barrier.wait();
+                let result = cleanup_fs
+                    .delete_lost_worker_locations(&expired)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = cleanup_tx.send(result);
+            });
+
+            let rejoin_fs = fs.clone();
+            let mut restarted = header.clone();
+            restarted.worker_session_id = Some(format!("concurrent-session-{iteration}"));
+            restarted.fs_ctime += 1;
+            let block_id = block.block.id;
+            let block_size = before.block_size;
+            let (rejoin_tx, rejoin_rx) = std::sync::mpsc::channel();
+            let rejoin_thread = std::thread::spawn(move || {
+                barrier.wait();
+                offline_heartbeat(&rejoin_fs, &restarted, HeartbeatStatus::Start);
+                let mut deleted =
+                    offline_report(&rejoin_fs, &restarted, true, &[(block_id, block_size)]);
+                offline_wait_for_full_report(&rejoin_fs, &restarted);
+                restarted.status = HeartbeatStatus::Running.into();
+                deleted.extend(
+                    MasterHandler::process_worker_heartbeat(rejoin_fs, restarted)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|command| match command {
+                            WorkerCommand::DeleteBlock(command) => command.blocks,
+                        }),
+                );
+                let _ = rejoin_tx.send(deleted);
+            });
+
+            // Receive before joining so a lock-order regression fails within a
+            // bounded interval instead of hanging the entire test process.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let cleanup_result = cleanup_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("concurrent cleanup did not finish within ten seconds");
+            let deleted = rejoin_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("concurrent rejoin did not finish within ten seconds");
+            cleanup_thread.join().unwrap();
+            rejoin_thread.join().unwrap();
+            cleanup_result.unwrap();
+
+            assert_eq!(
+                fs.worker_manager
+                    .read()
+                    .get_worker(header.worker_id)
+                    .unwrap()
+                    .worker_session_id,
+                format!("concurrent-session-{iteration}")
+            );
+            let after = fs.get_block_locations(path).unwrap();
+            let worker_blocks = fs
+                .fs_dir
+                .read()
+                .get_worker_block_ids(header.worker_id)
+                .unwrap();
+            assert_eq!(after.status.len, before.len);
+            assert_eq!(
+                after.status.storage_policy.ufs_mtime,
+                before.storage_policy.ufs_mtime
+            );
+            assert!(after.status.ufs_exists());
+            if after.status.cv_valid(None) {
+                assert!(deleted.is_empty(), "retained cache must not be deleted");
+                assert_eq!(after.block_locs.len(), 1);
+                assert_eq!(after.block_locs[0].block.id, block_id);
+                assert_eq!(after.block_locs[0].locs.len(), 1);
+                assert_eq!(after.block_locs[0].locs[0].worker_id, header.worker_id);
+                assert_eq!(worker_blocks, vec![block_id]);
+            } else {
+                assert!(!after.status.cv_exists());
+                assert!(after.block_locs.is_empty());
+                assert!(worker_blocks.is_empty());
+                assert!(
+                    deleted.contains(&block_id),
+                    "invalidated cache must be deleted from the returning worker"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offline_worker_restart_empty_full_report_invalidates_missing_cache() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/lost-on-restart-cache";
+        let (before, _) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("empty-storage-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(&fs, &restarted, true, &[]).is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        offline_wait_for_reconcile(|| {
+            !fs.file_status(path).unwrap().cv_valid(None)
+                && fs
+                    .fs_dir
+                    .read()
+                    .get_worker_block_ids(header.worker_id)
+                    .unwrap()
+                    .is_empty()
+        });
+
+        let after = fs.file_status(path).unwrap();
+        assert!(!after.cv_exists());
+        assert!(after.ufs_exists());
+        assert_eq!(after.len, before.len);
+        assert_eq!(
+            after.storage_policy.ufs_mtime,
+            before.storage_policy.ufs_mtime
+        );
+        assert!(fs.get_block_locations(path).unwrap().block_locs.is_empty());
+    }
+
+    #[test]
+    fn offline_worker_partial_full_report_waits_before_invalidating_missing_cache() {
+        let (fs, header) = offline_worker_fs();
+        let (first, first_block) =
+            offline_cache_file(&fs, "/first-reported-cache", TtlAction::Delete, true);
+        let (last, last_block) =
+            offline_cache_file(&fs, "/last-reported-cache", TtlAction::Delete, true);
+        let (_, missing_block) =
+            offline_cache_file(&fs, "/missing-from-report-cache", TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("partial-report-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        let mut first_report = offline_report_request(
+            &restarted,
+            true,
+            &[(first_block.block.id, first.block_size)],
+        );
+        first_report.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, first_report)
+                .unwrap()
+                .is_empty()
+        );
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+        assert!(fs
+            .file_status("/missing-from-report-cache")
+            .unwrap()
+            .cv_valid(None));
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .contains(&missing_block.block.id));
+
+        let mut last_report =
+            offline_report_request(&restarted, true, &[(last_block.block.id, last.block_size)]);
+        last_report.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, last_report)
+                .unwrap()
+                .is_empty()
+        );
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+
+        let missing = fs
+            .get_block_locations("/missing-from-report-cache")
+            .unwrap();
+        assert!(!missing.status.cv_valid(None));
+        assert!(missing.status.ufs_exists());
+        assert!(missing.block_locs.is_empty());
+        for path in ["/first-reported-cache", "/last-reported-cache"] {
+            let kept = fs.get_block_locations(path).unwrap();
+            assert!(kept.status.cv_valid(None));
+            assert_eq!(kept.block_locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs[0].worker_id, header.worker_id);
+        }
+    }
+
+    #[test]
+    fn offline_worker_incremental_report_between_full_chunks_preserves_recovery() {
+        let (fs, header) = offline_worker_fs();
+        let (first, first_block) =
+            offline_cache_file(&fs, "/interleaved-first-cache", TtlAction::Delete, true);
+        let (last, last_block) =
+            offline_cache_file(&fs, "/interleaved-last-cache", TtlAction::Delete, true);
+        let (incremental, incremental_block) =
+            offline_cache_file(&fs, "/interleaved-current-cache", TtlAction::Delete, true);
+        offline_cache_file(&fs, "/interleaved-missing-cache", TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("interleaved-report-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+
+        let mut first_report = offline_report_request(
+            &restarted,
+            true,
+            &[(first_block.block.id, first.block_size)],
+        );
+        first_report.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, first_report)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            false,
+            &[(incremental_block.block.id, incremental.block_size)],
+        )
+        .is_empty());
+        // Incremental IDs must supplement the inventory without counting as
+        // missing chunks of the startup snapshot or canceling its progress.
+        assert!(!fs.worker_manager.read().worker_block_report_complete(
+            header.worker_id,
+            restarted.worker_session_id.as_deref().unwrap(),
+        ));
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+
+        let mut last_report =
+            offline_report_request(&restarted, true, &[(last_block.block.id, last.block_size)]);
+        last_report.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, last_report)
+                .unwrap()
+                .is_empty()
+        );
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+
+        for path in [
+            "/interleaved-first-cache",
+            "/interleaved-last-cache",
+            "/interleaved-current-cache",
+        ] {
+            let kept = fs.get_block_locations(path).unwrap();
+            assert!(kept.status.cv_valid(None), "reported cache {path} was lost");
+            assert_eq!(kept.block_locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs[0].worker_id, header.worker_id);
+        }
+        let missing = fs
+            .get_block_locations("/interleaved-missing-cache")
+            .unwrap();
+        assert!(!missing.status.cv_valid(None));
+        assert!(missing.status.ufs_exists());
+        assert!(missing.block_locs.is_empty());
+    }
+
+    #[test]
+    fn offline_worker_incremental_report_preserves_queued_full_reconcile() {
+        let (fs, header) = offline_worker_fs();
+        let (snapshot, snapshot_block) =
+            offline_cache_file(&fs, "/queued-snapshot-cache", TtlAction::Delete, true);
+        let (incremental, incremental_block) =
+            offline_cache_file(&fs, "/queued-current-cache", TtlAction::Delete, true);
+        offline_cache_file(&fs, "/queued-missing-cache", TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("queued-report-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+
+        // Occupy this worker's executor lane before its reconcile is queued.
+        // Dropping the sender on a test failure also releases the blocker.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        fs.full_block_reconcile_executor_for_test()
+            .fixed_spawn(header.worker_id as i64, move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reconcile executor blocker did not start within five seconds");
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(snapshot_block.block.id, snapshot.block_size)],
+        )
+        .is_empty());
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            false,
+            &[(incremental_block.block.id, incremental.block_size)],
+        )
+        .is_empty());
+        assert!(!fs.worker_manager.read().worker_block_report_complete(
+            header.worker_id,
+            restarted.worker_session_id.as_deref().unwrap(),
+        ));
+        release_tx.send(()).unwrap();
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+
+        for path in ["/queued-snapshot-cache", "/queued-current-cache"] {
+            let kept = fs.get_block_locations(path).unwrap();
+            assert!(kept.status.cv_valid(None), "reported cache {path} was lost");
+            assert_eq!(kept.block_locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs[0].worker_id, header.worker_id);
+        }
+        let missing = fs.get_block_locations("/queued-missing-cache").unwrap();
+        assert!(!missing.status.cv_valid(None));
+        assert!(missing.status.ufs_exists());
+        assert!(missing.block_locs.is_empty());
+        let mut actual_ids = fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap();
+        actual_ids.sort_unstable();
+        let mut expected_ids = vec![snapshot_block.block.id, incremental_block.block.id];
+        expected_ids.sort_unstable();
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn offline_worker_stale_start_preserves_full_report_progress_and_live_session() {
+        let (fs, header) = offline_worker_fs();
+        let (first, first_block) =
+            offline_cache_file(&fs, "/stale-start-first-cache", TtlAction::Delete, true);
+        let (last, last_block) =
+            offline_cache_file(&fs, "/stale-start-last-cache", TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("newer-start-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+
+        let mut first_report = offline_report_request(
+            &restarted,
+            true,
+            &[(first_block.block.id, first.block_size)],
+        );
+        first_report.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, first_report)
+                .unwrap()
+                .is_empty()
+        );
+        let mut stale_start = header.clone();
+        stale_start.status = HeartbeatStatus::Start.into();
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stale_start.clone()).is_err());
+
+        // Rejected Start must not reset the accumulated first report chunk.
+        let mut last_report =
+            offline_report_request(&restarted, true, &[(last_block.block.id, last.block_size)]);
+        last_report.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, last_report)
+                .unwrap()
+                .is_empty()
+        );
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stale_start).is_err());
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(header.worker_id)
+                .unwrap()
+                .worker_session_id,
+            "newer-start-session"
+        );
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX)
+            .is_empty());
+        for path in ["/stale-start-first-cache", "/stale-start-last-cache"] {
+            let kept = fs.get_block_locations(path).unwrap();
+            assert!(kept.status.cv_valid(None));
+            assert_eq!(kept.block_locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs.len(), 1);
+            assert_eq!(kept.block_locs[0].locs[0].worker_id, header.worker_id);
+        }
+    }
+
+    #[test]
+    fn offline_worker_empty_full_report_preserves_surviving_replica() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/replicated-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        let mut survivor = header.clone();
+        survivor.worker_id = 8;
+        survivor.address.worker_id = 8;
+        survivor.address.hostname = "surviving-worker".into();
+        offline_heartbeat(&fs, &survivor, HeartbeatStatus::Running);
+        fs.fs_dir
+            .read()
+            .add_block_location(block.block.id, BlockLocation::with_id(survivor.worker_id))
+            .unwrap();
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("empty-replica-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(&fs, &restarted, true, &[]).is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+
+        let kept = fs.get_block_locations(path).unwrap();
+        assert!(kept.status.cv_valid(None));
+        assert_eq!(
+            kept.status.storage_policy.state,
+            before.storage_policy.state
+        );
+        assert_eq!(kept.block_locs.len(), 1);
+        assert_eq!(kept.block_locs[0].locs.len(), 1);
+        assert_eq!(kept.block_locs[0].locs[0].worker_id, survivor.worker_id);
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn offline_worker_stale_session_full_report_cannot_delete_recovered_cache() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/current-session-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("current-report-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(block.block.id, before.block_size)],
+        )
+        .is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+
+        let stale_empty_report = offline_report_request(&header, true, &[]);
+        assert!(MasterHandler::process_block_report(fs.clone(), None, stale_empty_report).is_err());
+        let stale_finalized_report =
+            offline_report_request(&header, false, &[(block.block.id, before.block_size)]);
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, stale_finalized_report).is_err()
+        );
+
+        let kept = fs.get_block_locations(path).unwrap();
+        assert!(kept.status.cv_valid(None));
+        assert_eq!(kept.block_locs.len(), 1);
+        assert_eq!(kept.block_locs[0].block.id, block.block.id);
+        assert_eq!(kept.block_locs[0].locs.len(), 1);
+        assert_eq!(kept.block_locs[0].locs[0].worker_id, header.worker_id);
+    }
+
+    #[test]
+    fn offline_worker_late_finalized_report_cannot_resurrect_cleaned_cache() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/late-reported-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let pending = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(pending.len(), 1);
+        fs.delete_lost_worker_locations(&pending[0]).unwrap();
+        assert!(!fs.file_status(path).unwrap().cv_valid(None));
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("late-finalized-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        let deleted = offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(block.block.id, before.block_size)],
+        );
+        assert_eq!(deleted, vec![block.block.id]);
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+        let after = fs.get_block_locations(path).unwrap();
+        assert!(!after.status.cv_valid(None));
+        assert!(after.status.ufs_exists());
+        assert!(after.block_locs.is_empty());
+    }
+
+    #[test]
+    fn offline_worker_end_retains_cache_until_grace_expires() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/grace-period-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        let grace_ms = fs
+            .worker_manager
+            .read()
+            .conf
+            .master
+            .worker_lost_interval_ms();
+        assert!(grace_ms > 0);
+        let before_end = curvine_runtime::common::LocalTime::mills();
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let before_expiry = before_end.saturating_add(grace_ms).saturating_sub(1);
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(before_expiry)
+            .is_empty());
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+        assert!(fs.file_status(path).unwrap().cv_valid(None));
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .contains(&block.block.id));
+        assert!(fs.get_block_locations(path).is_err());
+
+        let expired = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(expired.len(), 1);
+        fs.delete_lost_worker_locations(&expired[0]).unwrap();
+        let after = fs.get_block_locations(path).unwrap();
+        assert!(!after.status.cv_valid(None));
+        assert!(after.status.ufs_exists());
+        assert_eq!(after.status.len, before.len);
+        assert_eq!(
+            after.status.storage_policy.ufs_mtime,
+            before.storage_policy.ufs_mtime
+        );
+        assert!(after.block_locs.is_empty());
+    }
+
+    #[test]
+    fn offline_worker_cleanup_preserves_storage_policy_guarantees() {
+        for (ttl_action, ufs_backed, survivor) in [
+            (TtlAction::Delete, true, false),
+            (TtlAction::Delete, true, true),
+            (TtlAction::Free, true, false),
+            (TtlAction::Delete, false, false),
+        ] {
+            let (fs, header) = offline_worker_fs();
+            let path = "/offline-cache";
+            let (before, block) = offline_cache_file(&fs, path, ttl_action, ufs_backed);
+            if survivor {
+                let mut replica = header.clone();
+                replica.worker_id = 8;
+                replica.address.worker_id = 8;
+                replica.address.hostname = "surviving-worker".into();
+                offline_heartbeat(&fs, &replica, HeartbeatStatus::Running);
+                fs.fs_dir
+                    .read()
+                    .add_block_location(block.block.id, BlockLocation::with_id(8))
+                    .unwrap();
+            }
+
+            offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+            offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+            let pending = fs
+                .worker_manager
+                .write()
+                .take_expired_offline_workers(u64::MAX);
+            assert_eq!(pending.len(), 1, "duplicate End must not duplicate cleanup");
+            let cleanup = fs.delete_lost_worker_locations(&pending[0]).unwrap();
+            assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+
+            let invalidated = ttl_action == TtlAction::Delete && ufs_backed && !survivor;
+            let after = fs.file_status(path).unwrap();
+            assert_eq!(after.cv_exists(), !invalidated);
+            assert_eq!(after.ufs_exists(), ufs_backed);
+            assert_eq!(after.len, before.len);
+            assert_eq!(
+                after.storage_policy.ufs_mtime,
+                before.storage_policy.ufs_mtime
+            );
+            assert_eq!(
+                after.storage_policy.ttl_action,
+                before.storage_policy.ttl_action
+            );
+            if invalidated {
+                assert!(cleanup.replication_block_ids.is_empty());
+                assert!(!after.cv_valid(None));
+                assert!(fs.get_block_locations(path).unwrap().block_locs.is_empty());
+            } else {
+                assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+                assert_eq!(after.storage_policy.state, before.storage_policy.state);
+            }
+            if survivor {
+                let blocks = fs.get_block_locations(path).unwrap();
+                assert!(after.cv_valid(None));
+                assert_eq!(blocks.block_locs[0].locs.len(), 1);
+                assert_eq!(blocks.block_locs[0].locs[0].worker_id, 8);
+            }
+        }
+    }
+
+    #[test]
+    fn offline_worker_cleanup_skips_same_id_restart() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/restart-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let pending = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(pending.len(), 1);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("restarted-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(block.block.id, before.block_size)],
+        )
+        .is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        assert!(fs
+            .delete_lost_worker_locations(&pending[0])
+            .unwrap()
+            .removed_block_ids
+            .is_empty());
+        fs.worker_manager
+            .write()
+            .queue_offline_worker(pending[0].clone());
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX)
+            .is_empty());
+        let blocks = fs.get_block_locations(path).unwrap();
+        assert!(blocks.status.cv_valid(None));
+        assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    }
+
+    #[test]
+    fn offline_worker_failed_restart_after_cleanup_gets_new_expiry() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/restart-after-cleanup-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        let mut survivor = header.clone();
+        survivor.worker_id = 8;
+        survivor.address.worker_id = 8;
+        survivor.address.hostname = "restart-cleanup-survivor".into();
+        survivor.address.rpc_port += 1;
+        offline_heartbeat(&fs, &survivor, HeartbeatStatus::Running);
+        fs.fs_dir
+            .read()
+            .add_block_location(block.block.id, BlockLocation::with_id(survivor.worker_id))
+            .unwrap();
+
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let first_expiry = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(first_expiry.len(), 1);
+        fs.delete_lost_worker_locations(&first_expiry[0]).unwrap();
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX)
+            .is_empty());
+        let retained = fs.get_block_locations(path).unwrap();
+        assert!(retained.status.cv_valid(None));
+        assert_eq!(retained.block_locs[0].locs.len(), 1);
+        assert_eq!(retained.block_locs[0].locs[0].worker_id, survivor.worker_id);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("restart-after-completed-cleanup".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        let mut partial =
+            offline_report_request(&restarted, true, &[(block.block.id, before.block_size)]);
+        partial.total_len = 2;
+        assert!(
+            MasterHandler::process_block_report(fs.clone(), None, partial)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .contains(&block.block.id));
+
+        // This startup never completes its inventory or sends Running. The
+        // previous cleanup finished, so Start must have armed a fresh deadline.
+        let second_expiry = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(second_expiry.len(), 1, "failed restart needs a new cleanup");
+        let cleanup = fs.delete_lost_worker_locations(&second_expiry[0]).unwrap();
+        assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+        assert!(fs.file_status(path).unwrap().cv_valid(None));
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+
+        // Losing the remaining replica must now invalidate the cache, without
+        // the failed startup's partial report masquerading as a surviving copy.
+        let last_worker = fs
+            .worker_manager
+            .write()
+            .remove_expired_worker(survivor.worker_id)
+            .unwrap();
+        let cleanup = fs.delete_lost_worker_locations(&last_worker).unwrap();
+        assert!(cleanup.replication_block_ids.is_empty());
+        let after = fs.get_block_locations(path).unwrap();
+        assert!(!after.status.cv_valid(None));
+        assert!(after.status.ufs_exists());
+        assert_eq!(after.status.len, before.len);
+        assert_eq!(
+            after.status.storage_policy.ufs_mtime,
+            before.storage_policy.ufs_mtime
+        );
+        assert!(after.block_locs.is_empty());
+    }
+
+    #[test]
+    fn offline_worker_partial_report_after_expiry_gets_new_cleanup() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/late-partial-report-cache";
+        let (before, late_block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        let (early, early_block) =
+            offline_cache_file(&fs, "/early-partial-report-cache", TtlAction::Delete, true);
+        let mut survivor = header.clone();
+        survivor.worker_id = 8;
+        survivor.address.worker_id = 8;
+        survivor.address.hostname = "late-report-survivor".into();
+        survivor.address.rpc_port += 1;
+        offline_heartbeat(&fs, &survivor, HeartbeatStatus::Running);
+        for block_id in [early_block.block.id, late_block.block.id] {
+            fs.fs_dir
+                .read()
+                .add_block_location(block_id, BlockLocation::with_id(survivor.worker_id))
+                .unwrap();
+        }
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("partial-report-spans-expiry".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        let mut first = offline_report_request(
+            &restarted,
+            true,
+            &[(early_block.block.id, early.block_size)],
+        );
+        first.total_len = 3;
+        assert!(MasterHandler::process_block_report(fs.clone(), None, first)
+            .unwrap()
+            .is_empty());
+        let first_expiry = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(first_expiry.len(), 1);
+        fs.delete_lost_worker_locations(&first_expiry[0]).unwrap();
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX)
+            .is_empty());
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+        assert!(fs.file_status(path).unwrap().cv_valid(None));
+
+        // The worker continues its original report after cleanup has finished,
+        // but never sends the third chunk or reaches Running. Accepting this
+        // late location must create another bounded cleanup opportunity.
+        let mut late = offline_report_request(
+            &restarted,
+            true,
+            &[(late_block.block.id, before.block_size)],
+        );
+        late.total_len = 3;
+        assert!(MasterHandler::process_block_report(fs.clone(), None, late)
+            .unwrap()
+            .is_empty());
+        assert!(!fs.worker_manager.read().worker_block_report_complete(
+            header.worker_id,
+            restarted.worker_session_id.as_deref().unwrap(),
+        ));
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(header.worker_id)
+            .is_none());
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_worker_block_ids(header.worker_id)
+                .unwrap(),
+            vec![late_block.block.id]
+        );
+        let second_expiry = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(second_expiry.len(), 1, "late report needs a new cleanup");
+        let cleanup = fs.delete_lost_worker_locations(&second_expiry[0]).unwrap();
+        assert_eq!(cleanup.removed_block_ids, vec![late_block.block.id]);
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_worker_block_ids(header.worker_id)
+            .unwrap()
+            .is_empty());
+
+        let last_worker = fs
+            .worker_manager
+            .write()
+            .remove_expired_worker(survivor.worker_id)
+            .unwrap();
+        let cleanup = fs.delete_lost_worker_locations(&last_worker).unwrap();
+        assert!(cleanup.replication_block_ids.is_empty());
+        for path in [path, "/early-partial-report-cache"] {
+            let after = fs.get_block_locations(path).unwrap();
+            assert!(!after.status.cv_valid(None));
+            assert!(after.status.ufs_exists());
+            assert!(after.block_locs.is_empty());
+        }
+    }
+
+    #[test]
+    fn offline_worker_cleanup_survives_failed_restart() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/failed-restart-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("failed-restart-session".into());
+        restarted.fs_ctime += 1;
+        // A worker can announce Start and fail before sending Running. It has
+        // not recovered its data, so the original loss must still be cleaned.
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(fs.worker_manager.read().get_worker(7).is_none());
+        let pending = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(pending.len(), 1);
+
+        let cleanup = fs.delete_lost_worker_locations(&pending[0]).unwrap();
+        assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+        assert!(cleanup.replication_block_ids.is_empty());
+        let after = fs.file_status(path).unwrap();
+        assert!(!after.cv_valid(None));
+        assert!(after.ufs_exists());
+        assert_eq!(after.len, before.len);
+        assert_eq!(
+            after.storage_policy.ufs_mtime,
+            before.storage_policy.ufs_mtime
+        );
+        assert!(fs.get_block_locations(path).unwrap().block_locs.is_empty());
+    }
+
+    #[test]
+    fn offline_worker_ignores_end_from_previous_session() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/new-session-cache";
+        let (before, block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        let mut restarted = header.clone();
+        restarted.worker_session_id = Some("restarted-session".into());
+        restarted.fs_ctime += 1;
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Start);
+        assert!(offline_report(
+            &fs,
+            &restarted,
+            true,
+            &[(block.block.id, before.block_size)],
+        )
+        .is_empty());
+        offline_wait_for_full_report(&fs, &restarted);
+        offline_heartbeat(&fs, &restarted, HeartbeatStatus::Running);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+
+        let mut wrong_endpoint = restarted.clone();
+        wrong_endpoint.address.hostname = "different-worker".into();
+        offline_heartbeat(&fs, &wrong_endpoint, HeartbeatStatus::End);
+
+        assert!(fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX)
+            .is_empty());
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "restarted-session"
+        );
+        assert!(fs.get_block_locations(path).unwrap().status.cv_valid(None));
+    }
+
+    #[test]
+    fn offline_worker_cleanup_keeps_different_id_replacement() {
+        let (fs, header) = offline_worker_fs();
+        let path = "/lost-cache";
+        let (_, lost_block) = offline_cache_file(&fs, path, TtlAction::Delete, true);
+        offline_heartbeat(&fs, &header, HeartbeatStatus::End);
+        let pending = fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(u64::MAX);
+        assert_eq!(pending.len(), 1);
+
+        let mut replacement = header.clone();
+        replacement.worker_id = 8;
+        replacement.address.worker_id = 8;
+        replacement.worker_session_id = Some("fresh-storage".into());
+        replacement.fs_ctime += 1;
+        offline_heartbeat(&fs, &replacement, HeartbeatStatus::Start);
+        assert!(offline_report(&fs, &replacement, true, &[]).is_empty());
+        offline_wait_for_full_report(&fs, &replacement);
+        offline_heartbeat(&fs, &replacement, HeartbeatStatus::Running);
+        let (_, new_block) = offline_cache_file(&fs, "/new-cache", TtlAction::Delete, true);
+
+        let cleanup = fs.delete_lost_worker_locations(&pending[0]).unwrap();
+        assert_eq!(cleanup.removed_block_ids, vec![lost_block.block.id]);
+        assert!(cleanup.replication_block_ids.is_empty());
+        assert!(!fs.file_status(path).unwrap().cv_valid(None));
+        let blocks = fs.get_block_locations("/new-cache").unwrap();
+        assert!(blocks.status.cv_valid(None));
+        assert_eq!(blocks.block_locs[0].block.id, new_block.block.id);
+        assert_eq!(blocks.block_locs[0].locs[0].worker_id, 8);
+    }
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {

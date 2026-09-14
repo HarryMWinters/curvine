@@ -41,9 +41,13 @@ impl WorkerMap {
         }
     }
 
-    pub fn remove(&mut self, addr: &WorkerAddress) {
-        self.workers.swap_remove(&addr.worker_id);
-        self.lost_workers.swap_remove(&addr.worker_id);
+    pub fn remove_for_restart(&mut self, addr: &WorkerAddress) -> Option<WorkerInfo> {
+        // Start does not establish recovery: initialization or the full block
+        // report may still fail. Keep the former registration available for
+        // loss cleanup until a reconciled worker becomes ready again.
+        let worker = self.workers.swap_remove(&addr.worker_id)?;
+        self.lost_workers.insert(addr.worker_id, worker.clone());
+        Some(worker)
     }
 
     pub fn remove_same_endpoint(&mut self, addr: &WorkerAddress) -> Vec<WorkerInfo> {
@@ -62,7 +66,7 @@ impl WorkerMap {
         let mut removed = Vec::with_capacity(stale_worker_ids.len());
         for worker_id in stale_worker_ids {
             if let Some(worker) = self.workers.swap_remove(&worker_id) {
-                self.lost_workers.swap_remove(&worker_id);
+                self.lost_workers.insert(worker_id, worker.clone());
                 removed.push(worker);
             }
         }
