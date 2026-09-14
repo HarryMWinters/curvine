@@ -42,9 +42,6 @@ impl WorkerMap {
     }
 
     pub fn remove_for_restart(&mut self, addr: &WorkerAddress) -> Option<WorkerInfo> {
-        // Start does not establish recovery: initialization or the full block
-        // report may still fail. Keep the former registration available for
-        // loss cleanup until a reconciled worker becomes ready again.
         let worker = self.workers.swap_remove(&addr.worker_id)?;
         self.lost_workers.insert(addr.worker_id, worker.clone());
         Some(worker)
