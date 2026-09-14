@@ -91,6 +91,7 @@ fn report(
         BlockReportList {
             cluster_id: "curvine".into(),
             worker_id,
+            worker_session_id: String::new(),
             full_report,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(

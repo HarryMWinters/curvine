@@ -509,6 +509,7 @@ impl ProtoUtils {
         let mut dst = BlockReportList {
             cluster_id: list.cluster_id,
             worker_id: list.worker_id,
+            worker_session_id: list.worker_session_id.unwrap_or_default(),
             full_report: list.full_report,
             total_len: list.total_len,
             blocks: vec![],

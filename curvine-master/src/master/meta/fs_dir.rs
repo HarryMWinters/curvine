@@ -1070,8 +1070,11 @@ impl FsDir {
     /// be scheduled for deletion from any surviving workers.
     pub(crate) fn invalidate_lost_cache_files(
         &mut self,
+        _worker_id: u32,
         block_ids: &[i64],
+        prepared_block_ids: &mut HashSet<i64>,
     ) -> FsResult<CacheInvalidationResult> {
+        let affected_ids: HashSet<_> = block_ids.iter().copied().collect();
         let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
         let mut result = CacheInvalidationResult::default();
         let mut changed_inodes = Vec::new();
@@ -1086,8 +1089,21 @@ impl FsDir {
 
             // Cache-mode load jobs use the Delete TTL action. Files in fs-mode
             // use Free instead and retain their normal replica-recovery path.
+            if file.storage_policy.ttl_action != TtlAction::Delete {
+                continue;
+            }
+            if file.storage_policy.ufs_only() && file.blocks.is_empty() {
+                // An earlier attempt may have applied this inode and then
+                // failed to journal it. Retry the current state, never a saved
+                // snapshot that could overwrite a newer write or reload.
+                changed_inodes.push(inode);
+                continue;
+            }
             if !file.storage_policy.both_exists()
-                || file.storage_policy.ttl_action != TtlAction::Delete
+                || !file
+                    .blocks
+                    .iter()
+                    .any(|block| affected_ids.contains(&block.id))
             {
                 continue;
             }
@@ -1115,8 +1131,17 @@ impl FsDir {
             }
         }
 
+        // The caller retains these IDs even if storage or journaling fails.
+        prepared_block_ids.extend(result.invalidated_block_ids.iter().copied());
         let journal_inodes = changed_inodes.clone();
         self.store.apply_cache_invalidations(changed_inodes)?;
+        crate::fault_point! {
+            sync,
+            name: "master.cache.after_apply_lost_chunk",
+            description: "Fail cache invalidation after inode apply and before journal append",
+            context: { "worker_id" => _worker_id, },
+            return_error: |fault| Err(FsError::common(fault.message)),
+        }
         self.journal_writer
             .log_cache_invalidations(self, journal_inodes)?;
         Ok(result)

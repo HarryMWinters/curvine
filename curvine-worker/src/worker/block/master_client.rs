@@ -112,6 +112,7 @@ impl MasterClient {
         let mut req = BlockReportListRequest {
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
+            worker_session_id: Some(self.worker_session_id.clone()),
             full_report: true,
             total_len: total_size as u64,
             blocks: vec![],
@@ -147,6 +148,7 @@ impl MasterClient {
         let mut req = BlockReportListRequest {
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
+            worker_session_id: Some(self.worker_session_id.clone()),
             full_report: false,
             total_len: blocks.len() as u64,
             blocks: vec![],

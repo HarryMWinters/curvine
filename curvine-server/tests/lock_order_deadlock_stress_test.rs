@@ -99,6 +99,7 @@ fn stress_add_block_vs_block_report_no_hang() {
             let report = BlockReportList {
                 cluster_id: "curvine".into(),
                 worker_id: 100,
+                worker_session_id: String::new(),
                 full_report: false,
                 total_len: 0,
                 blocks: vec![BlockReportInfo::new(
@@ -179,6 +180,7 @@ fn sanity_single_thread_paths_progress() {
         let report = BlockReportList {
             cluster_id: "curvine".into(),
             worker_id: 100,
+            worker_session_id: String::new(),
             full_report: false,
             total_len: 0,
             blocks: vec![BlockReportInfo::new(
