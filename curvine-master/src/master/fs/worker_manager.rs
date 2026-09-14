@@ -272,8 +272,7 @@ impl WorkerManager {
 
     pub fn remove_expired_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         let worker = self.worker_map.remove_expired(id)?;
-        // The heartbeat timeout has already elapsed. Its first cleanup is
-        // dispatched by the checker directly, and retries stay immediately due.
+        // Timeout has already elapsed; retries must not add another grace period.
         self.schedule_offline_worker(worker.clone(), 0, true);
         Some(worker)
     }

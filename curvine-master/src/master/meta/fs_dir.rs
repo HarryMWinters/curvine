@@ -1021,8 +1021,7 @@ impl FsDir {
     ) -> FsResult<Vec<i64>> {
         let mut batch = self.store.new_batch();
         let mut delete_blocks = Vec::new();
-        // A report chunk can contain many blocks from the same file. Build its
-        // membership set once, without assuming the vector is sorted by ID.
+        // File block vectors are not guaranteed to be sorted by ID.
         let mut current_blocks = HashMap::new();
         for block in blocks {
             if block.status == BlockReportStatus::Deleted {

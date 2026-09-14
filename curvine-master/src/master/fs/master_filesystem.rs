@@ -1480,8 +1480,7 @@ impl MasterFilesystem {
                 fs.run_full_block_reconcile(worker_id);
             });
         if let Err(e) = &res {
-            // The queued inventory remains retryable, including a newer report
-            // that may have replaced the job while submission was attempted.
+            // Retain the queued inventory so a failed submission can be retried.
             if let Some(state) = self.full_block_reconciles.lock().get_mut(&worker_id) {
                 state.running = false;
                 state.retry_at_ms = self.full_block_reconcile_retry_at();
@@ -1508,7 +1507,6 @@ impl MasterFilesystem {
                 .collect()
         };
         for worker_id in workers {
-            // A full executor queue is retried at the next check interval.
             let _ = self.spawn_full_block_reconcile(worker_id);
         }
     }
@@ -1577,7 +1575,6 @@ impl MasterFilesystem {
                         worker_id, e
                     );
                     if let Some(state) = self.full_block_reconciles.lock().get_mut(&worker_id) {
-                        // Never overwrite an inventory submitted after this job.
                         if state.generation == job.generation && state.pending.is_none() {
                             state.pending = Some(job);
                             state.retry_at_ms = self.full_block_reconcile_retry_at();
@@ -1689,9 +1686,7 @@ impl MasterFilesystem {
         worker_id: u32,
         block_ids: Vec<i64>,
     ) -> FsResult<LostWorkerLocationCleanup> {
-        // Capture the complete affected inventory before deleting any index
-        // entries. Exact batched removal updates both indexes atomically; after
-        // a failure, the remaining index entries and these IDs allow a retry.
+        // Retain affected IDs so cleanup remains retryable after locations are removed.
         self.lost_worker_cleanups
             .lock()
             .entry(worker_id)
@@ -1745,9 +1740,7 @@ impl MasterFilesystem {
                 let mut prepared_ids = HashSet::new();
                 let invalidation =
                     fs_dir.invalidate_lost_cache_files(worker_id, chunk, &mut prepared_ids);
-                // A journal error can follow the inode update. Retain every
-                // discarded file block, including replicas on other workers,
-                // before propagating that error to the retry scheduler.
+                // Retain discarded IDs even if journaling fails after the inode update.
                 self.lost_worker_cleanups
                     .lock()
                     .get_mut(&worker_id)

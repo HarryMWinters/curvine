@@ -101,9 +101,6 @@ fn test_cache_mode_recaches_after_worker_end() {
 fn test_cache_mode_recaches_after_worker_removal(graceful_end: bool) {
     let testing = Testing::builder()
         .workers(2)
-        // The first worker remains alive in this in-process test, but the
-        // master treats it as lost. Synchronizing with a fresh heartbeat below
-        // leaves time for the cache reload before the worker re-registers.
         .mutate_conf(move |conf| {
             conf.master.heartbeat_interval = if graceful_end { "200ms" } else { "10s" }.into();
             conf.master.worker_check_interval = "100ms".to_string();
@@ -118,7 +115,7 @@ fn test_cache_mode_recaches_after_worker_removal(graceful_end: bool) {
     let rt = Arc::new(AsyncRuntime::single());
     let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
 
-    // Keep the cluster's runtime owners outside the async context at teardown.
+    // Dropping a Tokio runtime within an async context panics.
     rt.block_on(async {
         let mount_dir = if graceful_end {
             "cache_mode_worker_end_recache"
@@ -236,7 +233,6 @@ fn test_cache_mode_recaches_after_worker_removal(graceful_end: bool) {
                 .result()
                 .expect("unreadable cache should be invalidated after the End grace period");
         } else {
-            // Preserve the original timeout-cleanup regression from #1526.
             assert!(master
                 .worker_manager
                 .write()

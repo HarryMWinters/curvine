@@ -1948,7 +1948,6 @@ mod tests {
         stale_start.status = HeartbeatStatus::Start.into();
         assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stale_start.clone()).is_err());
 
-        // Rejected Start must not reset the accumulated first report chunk.
         let mut last_report =
             offline_report_request(&restarted, true, &[(last_block.block.id, last.block_size)]);
         last_report.total_len = 2;
