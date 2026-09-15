@@ -102,6 +102,9 @@ fn report(
         },
         None,
     )?;
+    if full_report {
+        fs.wait_for_full_block_reconcile_for_test(worker_id)?;
+    }
     Ok(result.delete_blocks)
 }
 
@@ -210,6 +213,93 @@ fn reports_accept_current_blocks_and_remove_deleted_locations() -> CommonResult<
             .get_block_locations(block.block.id)?
             .iter()
             .all(|location| location.worker_id != 101));
+    }
+    Ok(())
+}
+
+#[test]
+fn reports_preserve_order_when_inode_group_mixes_current_and_obsolete_ids() -> CommonResult<()> {
+    let _serial = serial();
+    for full_report in [false, true] {
+        let fs = new_fs(if full_report {
+            "mixed-group-full"
+        } else {
+            "mixed-group-incremental"
+        });
+        let path = "/mixed-file";
+        let inode = fs.create(path, false)?;
+        let current = complete_block(&fs, path)?.block.id;
+        let obsolete_a = InodeId::create_block_id(inode.id, 100)?;
+        let obsolete_b = InodeId::create_block_id(inode.id, 101)?;
+        let mut replica = WorkerInfo::default();
+        replica.address.worker_id = 101;
+        replica.address.rpc_port = 667;
+        fs.add_test_worker(replica);
+
+        for delete_current in [false, true] {
+            for id in [obsolete_a, obsolete_b] {
+                fs.fs_dir
+                    .write()
+                    .add_block_location(id, BlockLocation::with_id(101))?;
+            }
+            let mut blocks: Vec<_> = [
+                (current, BlockReportStatus::Finalized, StorageType::Disk),
+                (obsolete_b, BlockReportStatus::Finalized, StorageType::Disk),
+                (current, BlockReportStatus::Deleted, StorageType::Disk),
+                (obsolete_a, BlockReportStatus::Writing, StorageType::Disk),
+                (current, BlockReportStatus::Writing, StorageType::Mem),
+                (obsolete_a, BlockReportStatus::Finalized, StorageType::Disk),
+                (obsolete_b, BlockReportStatus::Finalized, StorageType::Disk),
+                (current, BlockReportStatus::Finalized, StorageType::Ssd),
+            ]
+            .into_iter()
+            .map(|(id, status, storage)| BlockReportInfo::new(id, status, storage, 128))
+            .collect();
+            if delete_current {
+                blocks.push(BlockReportInfo::new(
+                    current,
+                    BlockReportStatus::Deleted,
+                    StorageType::Disk,
+                    128,
+                ));
+            }
+            let result = fs.block_report(
+                BlockReportList {
+                    cluster_id: "curvine".into(),
+                    worker_id: 101,
+                    full_report,
+                    // Full-report completion counts distinct IDs, not entries.
+                    total_len: 3,
+                    blocks,
+                },
+                None,
+            )?;
+            if full_report {
+                fs.wait_for_full_block_reconcile_for_test(101)?;
+            }
+            let expected_rejected = if full_report {
+                vec![obsolete_b, obsolete_a, obsolete_a, obsolete_b]
+            } else {
+                vec![obsolete_b, obsolete_a, obsolete_b]
+            };
+            assert_eq!(result.delete_blocks, expected_rejected);
+
+            let fs_dir = fs.fs_dir.read();
+            let mut locations: Vec<_> = fs_dir
+                .get_block_locations(current)?
+                .iter()
+                .map(|location| (location.worker_id, location.storage_type))
+                .collect();
+            locations.sort_unstable_by_key(|location| location.0);
+            let mut expected_locations = vec![(100, StorageType::Disk)];
+            if !delete_current {
+                expected_locations.push((101, StorageType::Ssd));
+            }
+            assert_eq!(locations, expected_locations);
+            for id in [obsolete_a, obsolete_b] {
+                assert!(fs_dir.get_block_locations(id)?.is_empty());
+            }
+        }
     }
     Ok(())
 }

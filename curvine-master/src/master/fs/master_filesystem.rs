@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{CacheInvalidationResult, FsDir};
+use crate::master::meta::{BlockReportDiagnostics, CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -29,7 +29,6 @@ use curvine_error::FsResult;
 use curvine_model::*;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
-use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1154,7 +1153,7 @@ impl MasterFilesystem {
         Ok(info)
     }
 
-    pub fn fs_dir(&self) -> ArcRwLock<FsDir> {
+    pub fn fs_dir(&self) -> SyncFsDir {
         self.fs_dir.clone()
     }
 
@@ -1308,6 +1307,7 @@ impl MasterFilesystem {
         }
 
         let mut delete_blocks = Vec::new();
+        let mut diagnostics = BlockReportDiagnostics::default();
         let mut blocks = list.blocks.into_iter();
         loop {
             let chunk: Vec<_> = blocks
@@ -1322,11 +1322,23 @@ impl MasterFilesystem {
                 .filter(|block| block.status == BlockReportStatus::Deleted)
                 .map(|block| block.id)
                 .collect();
-            let obsolete = self.fs_dir.write().apply_reported_blocks(
+            let mut chunk_diagnostics = BlockReportDiagnostics::default();
+            let result = FsDir::apply_reported_blocks_with_upgrade(
+                self.fs_dir.upgradable_read(),
                 list.worker_id,
                 list.full_report,
+                &mut chunk_diagnostics,
                 chunk,
-            )?;
+            );
+            chunk_diagnostics.log_chunk(list.worker_id, result.as_ref().err());
+            let obsolete = match result {
+                Ok(obsolete) => obsolete,
+                Err(e) => {
+                    diagnostics.log_summary(list.worker_id);
+                    return Err(e);
+                }
+            };
+            diagnostics.extend(chunk_diagnostics);
             let mut wm = self.worker_manager.write();
             for &id in &obsolete {
                 wm.remove_block(list.worker_id, id);
@@ -1337,11 +1349,20 @@ impl MasterFilesystem {
             delete_blocks.extend(obsolete);
         }
 
+        diagnostics.log_summary(list.worker_id);
         if let Some(reported_blocks) = full_reported_blocks {
             self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
         }
 
         Ok(BlockReportResult { delete_blocks })
+    }
+
+    #[doc(hidden)]
+    pub fn wait_for_full_block_reconcile_for_test(&self, worker_id: u32) -> FsResult<()> {
+        // Keep the test's filesystem owner alive until reconciliation releases its clone.
+        self.full_block_reconcile_executor
+            .fixed_spawn_blocking(worker_id as i64, || ())?;
+        Ok(())
     }
 
     fn submit_full_block_reconcile(

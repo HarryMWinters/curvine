@@ -32,6 +32,7 @@ use curvine_model::{
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
+use parking_lot::RwLockUpgradableReadGuard;
 use std::collections::{HashMap, HashSet, LinkedList};
 use std::mem;
 use std::sync::Arc;
@@ -47,6 +48,82 @@ pub struct FsDir {
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
 }
+
+struct PreparedBlockReport {
+    locations: Vec<(bool, i64, BlockLocation)>,
+    delete_blocks: Vec<i64>,
+}
+
+enum ReportedInodeBlocks {
+    File(HashSet<i64>),
+    Missing,
+    NotFile,
+}
+
+const BLOCK_REPORT_LOG_TARGET: &str = "curvine_master::master::fs::master_filesystem";
+
+enum DeferredWritingWarning {
+    Missing(i64),
+    NotFile(i64),
+}
+
+#[derive(Default)]
+pub(crate) struct BlockReportDiagnostics {
+    missing_blocks: usize,
+    not_file_blocks: usize,
+    obsolete_file_blocks: usize,
+    deferred_writing: Vec<DeferredWritingWarning>,
+    failed_inode_block: Option<BlockReportInfo>,
+}
+
+impl BlockReportDiagnostics {
+    pub(crate) fn extend(&mut self, chunk: Self) {
+        self.missing_blocks += chunk.missing_blocks;
+        self.not_file_blocks += chunk.not_file_blocks;
+        self.obsolete_file_blocks += chunk.obsolete_file_blocks;
+    }
+
+    pub(crate) fn log_chunk(&mut self, worker_id: u32, error: Option<&FsError>) {
+        for warning in self.deferred_writing.drain(..) {
+            match warning {
+                DeferredWritingWarning::Missing(id) => warn!(target: BLOCK_REPORT_LOG_TARGET,
+                    "block_report deferred deletion for writing block {} on worker {} because its inode is missing",
+                    id, worker_id
+                ),
+                DeferredWritingWarning::NotFile(id) => warn!(target: BLOCK_REPORT_LOG_TARGET,
+                    "block_report deferred deletion for writing block {} on worker {} because its inode is not a file",
+                    id, worker_id
+                ),
+            }
+        }
+        if let (Some(item), Some(e)) = (self.failed_inode_block.take(), error) {
+            warn!(target: BLOCK_REPORT_LOG_TARGET, "block_report {item:?}: {e}");
+        }
+    }
+
+    pub(crate) fn log_summary(&self, worker_id: u32) {
+        if self.missing_blocks > 0 || self.not_file_blocks > 0 {
+            warn!(target: BLOCK_REPORT_LOG_TARGET,
+                "block_report found {} missing-inode and {} non-file-inode blocks for worker {}; scheduling worker deletion",
+                self.missing_blocks, self.not_file_blocks, worker_id
+            );
+        }
+        if self.obsolete_file_blocks > 0 {
+            warn!(target: BLOCK_REPORT_LOG_TARGET,
+                "block_report found {} obsolete blocks in existing files for worker {}; scheduling worker deletion",
+                self.obsolete_file_blocks, worker_id
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "atomic_upgrade_tests.rs"]
+mod atomic_upgrade_tests;
+
+#[cfg(test)]
+#[path = "block_report_logging_tests.rs"]
+mod block_report_logging_tests;
 
 #[derive(Default)]
 pub(crate) struct CacheInvalidationResult {
@@ -1009,48 +1086,156 @@ impl FsDir {
         Ok(())
     }
 
-    /// Validate reported IDs against the current file block list while applying
-    /// locations. The caller's filesystem write lock prevents overwrite or cache
-    /// invalidation from discarding a block between validation and insertion.
-    /// Returns obsolete IDs that the worker should delete.
+    /// Keep membership decisions protected while allowing readers during validation.
+    pub(crate) fn apply_reported_blocks_with_upgrade(
+        fs_dir: RwLockUpgradableReadGuard<'_, Self>,
+        worker_id: u32,
+        full_report: bool,
+        diagnostics: &mut BlockReportDiagnostics,
+        blocks: Vec<BlockReportInfo>,
+    ) -> FsResult<Vec<i64>> {
+        Self::apply_reported_blocks_with_upgrade_hook(
+            fs_dir,
+            worker_id,
+            full_report,
+            diagnostics,
+            blocks,
+            || {},
+        )
+    }
+
+    fn apply_reported_blocks_with_upgrade_hook<F: FnOnce()>(
+        fs_dir: RwLockUpgradableReadGuard<'_, Self>,
+        worker_id: u32,
+        full_report: bool,
+        diagnostics: &mut BlockReportDiagnostics,
+        blocks: Vec<BlockReportInfo>,
+        after_prepare: F,
+    ) -> FsResult<Vec<i64>> {
+        let prepared =
+            fs_dir.prepare_reported_blocks(worker_id, full_report, blocks, diagnostics)?;
+        after_prepare();
+        let mut fs_dir = RwLockUpgradableReadGuard::upgrade(fs_dir);
+        fs_dir.apply_prepared_report(prepared)
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_reported_blocks(
         &mut self,
         worker_id: u32,
         full_report: bool,
         blocks: Vec<BlockReportInfo>,
     ) -> FsResult<Vec<i64>> {
-        let mut batch = self.store.new_batch();
+        let prepared = self.prepare_reported_blocks(
+            worker_id,
+            full_report,
+            blocks,
+            &mut BlockReportDiagnostics::default(),
+        )?;
+        self.apply_prepared_report(prepared)
+    }
+
+    fn apply_prepared_report(&mut self, prepared: PreparedBlockReport) -> FsResult<Vec<i64>> {
+        self.block_report(prepared.locations)?;
+        Ok(prepared.delete_blocks)
+    }
+
+    fn prepare_reported_blocks(
+        &self,
+        worker_id: u32,
+        full_report: bool,
+        blocks: Vec<BlockReportInfo>,
+        diagnostics: &mut BlockReportDiagnostics,
+    ) -> FsResult<PreparedBlockReport> {
+        let mut reported_ids: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for block in &blocks {
+            if block.status != BlockReportStatus::Deleted {
+                reported_ids
+                    .entry(InodeId::get_id(block.id))
+                    .or_default()
+                    .insert(block.id);
+            }
+        }
+
+        let mut locations = Vec::with_capacity(blocks.len());
         let mut delete_blocks = Vec::new();
-        // File block vectors are not guaranteed to be sorted by ID.
+        // Sparse reports need membership for only a few IDs from each file.
         let mut current_blocks = HashMap::new();
         for block in blocks {
             if block.status == BlockReportStatus::Deleted {
-                batch.delete_location(block.id, worker_id)?;
+                locations.push((false, block.id, BlockLocation::with_id(worker_id)));
                 continue;
             }
 
             let inode_id = InodeId::get_id(block.id);
-            let ids = match current_blocks.entry(inode_id) {
+            let current = match current_blocks.entry(inode_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let ids: HashSet<i64> = match self.store.get_inode(inode_id, None)? {
-                        Some(File(file)) => file.blocks.iter().map(|meta| meta.id).collect(),
-                        _ => HashSet::new(),
+                    let mut ids = reported_ids
+                        .remove(&inode_id)
+                        .expect("non-deleted report IDs are grouped by inode");
+                    let inode = match self.store.get_inode(inode_id, None) {
+                        Ok(inode) => inode,
+                        Err(e) => {
+                            diagnostics.failed_inode_block = Some(block);
+                            return Err(e.into());
+                        }
                     };
-                    entry.insert(ids)
+                    let current = match inode {
+                        Some(File(file)) if ids.len() == 1 => {
+                            ids.retain(|id| file.blocks.iter().any(|meta| meta.id == *id));
+                            ReportedInodeBlocks::File(ids)
+                        }
+                        Some(File(file)) => {
+                            let mut current = HashSet::with_capacity(ids.len());
+                            for meta in &file.blocks {
+                                if ids.remove(&meta.id) {
+                                    current.insert(meta.id);
+                                    if ids.is_empty() {
+                                        break;
+                                    }
+                                }
+                            }
+                            ReportedInodeBlocks::File(current)
+                        }
+                        None => ReportedInodeBlocks::Missing,
+                        Some(_) => ReportedInodeBlocks::NotFile,
+                    };
+                    entry.insert(current)
                 }
             };
-            if ids.contains(&block.id) {
-                batch.add_location(block.id, &BlockLocation::new(worker_id, block.storage_type))?;
+            if matches!(current, ReportedInodeBlocks::File(ids) if ids.contains(&block.id)) {
+                locations.push((
+                    true,
+                    block.id,
+                    BlockLocation::new(worker_id, block.storage_type),
+                ));
             } else if full_report || block.status == BlockReportStatus::Finalized {
-                batch.delete_location(block.id, worker_id)?;
+                match current {
+                    ReportedInodeBlocks::Missing => diagnostics.missing_blocks += 1,
+                    ReportedInodeBlocks::NotFile => diagnostics.not_file_blocks += 1,
+                    ReportedInodeBlocks::File(_) => diagnostics.obsolete_file_blocks += 1,
+                }
+                locations.push((false, block.id, BlockLocation::with_id(worker_id)));
                 delete_blocks.push(block.id);
+            } else {
+                match current {
+                    ReportedInodeBlocks::Missing => diagnostics
+                        .deferred_writing
+                        .push(DeferredWritingWarning::Missing(block.id)),
+                    ReportedInodeBlocks::NotFile => diagnostics
+                        .deferred_writing
+                        .push(DeferredWritingWarning::NotFile(block.id)),
+                    ReportedInodeBlocks::File(_) => {}
+                }
             }
             // An incremental Writing report can race metadata attachment.
             // Leave unknown IDs alone until a finalized or full report arrives.
         }
-        batch.commit()?;
-        Ok(delete_blocks)
+        Ok(PreparedBlockReport {
+            locations,
+            delete_blocks,
+        })
     }
 
     pub fn get_rocks_store(&self) -> &RocksInodeStore {
@@ -1537,7 +1722,7 @@ mod tests {
     use curvine_rocksdb::RocksUtils;
     use curvine_runtime::common::Utils;
 
-    fn report_test_fs(name: &str) -> MasterFilesystem {
+    pub(super) fn report_test_fs(name: &str) -> MasterFilesystem {
         Master::init_test_metrics();
         let mut conf = ClusterConf::format();
         conf.testing = true;
@@ -1555,7 +1740,7 @@ mod tests {
         fs
     }
 
-    fn create_file_blocks(
+    pub(super) fn create_file_blocks(
         fs: &MasterFilesystem,
         path: &str,
         count: usize,
@@ -1581,7 +1766,7 @@ mod tests {
         Ok(ids)
     }
 
-    fn replace_inode_record(
+    pub(super) fn replace_inode_record(
         fs: &MasterFilesystem,
         inode_id: i64,
         bytes: &[u8],
@@ -1594,7 +1779,10 @@ mod tests {
         Ok(previous)
     }
 
-    fn block_location_worker_ids(fs: &MasterFilesystem, id: i64) -> CommonResult<Vec<u32>> {
+    pub(super) fn block_location_worker_ids(
+        fs: &MasterFilesystem,
+        id: i64,
+    ) -> CommonResult<Vec<u32>> {
         let mut ids: Vec<_> = fs
             .fs_dir
             .read()
