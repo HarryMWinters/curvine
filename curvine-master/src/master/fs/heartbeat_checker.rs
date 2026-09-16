@@ -65,27 +65,51 @@ impl LoopTask for HeartbeatChecker {
 
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();
-        {
+        let now = LocalTime::mills();
+        self.fs.retry_full_block_reconciles(now);
+        let candidates = {
+            let wm = self.fs.worker_manager.read();
+            wm.get_last_heartbeat()
+                .into_iter()
+                .filter(|(_, last_update)| {
+                    now > last_update.saturating_add(self.worker_blacklist_ms)
+                        || now > last_update.saturating_add(self.worker_lost_ms)
+                })
+                .filter_map(|(id, _)| wm.get_worker(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        for candidate in candidates {
+            let id = candidate.worker_id();
+            let lifecycle = self.fs.worker_lifecycle_lock(id);
+            let _guard = lifecycle.lock();
             let mut wm = self.fs.worker_manager.write();
-            let workers = wm.get_last_heartbeat();
-            let now = LocalTime::mills();
-
-            for (id, last_update) in workers {
-                if now > last_update + self.worker_blacklist_ms {
-                    // Worker blacklist timeout
-                    if let Some(worker) = wm.add_blacklist_worker(id) {
-                        blacklisted_workers.push((id, worker.address, worker.last_update));
-                    }
+            let Some(current) = wm.get_worker(id) else {
+                continue;
+            };
+            if current.last_update != candidate.last_update
+                || current.address != candidate.address
+                || current.worker_session_id != candidate.worker_session_id
+                || current.startup_time_ms != candidate.startup_time_ms
+            {
+                continue;
+            }
+            let last_update = current.last_update;
+            if now > last_update.saturating_add(self.worker_blacklist_ms) {
+                if let Some(worker) = wm.add_blacklist_worker(id) {
+                    blacklisted_workers.push((id, worker.address, worker.last_update));
                 }
-
-                if now > last_update + self.worker_lost_ms {
-                    // Heartbeat timeout
-                    if let Some(worker) = wm.remove_expired_worker(id) {
-                        removed_workers.push((id, worker.address, worker.last_update));
-                    }
+            }
+            if now > last_update.saturating_add(self.worker_lost_ms) {
+                if let Some(worker) = wm.remove_expired_worker(id) {
+                    removed_workers.push(worker);
                 }
             }
         }
+        let offline_workers = self
+            .fs
+            .worker_manager
+            .write()
+            .take_expired_offline_workers(now);
 
         for (id, address, last_update) in blacklisted_workers {
             warn!(
@@ -94,20 +118,27 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update) in removed_workers {
+        for worker in &removed_workers {
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
-                id, address, last_update, self.worker_lost_ms
+                worker.worker_id(), worker.address, worker.last_update, self.worker_lost_ms
             );
+        }
+        removed_workers.extend(offline_workers);
+
+        for worker in removed_workers {
             // Asynchronously delete all block location data.
+            let id = worker.worker_id();
+            let retry_worker = worker.clone();
             let fs = self.fs.clone();
             let rm = self.replication_manager.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
-                let cleanup = match fs.delete_locations(id) {
+                let cleanup = match fs.delete_lost_worker_locations(&worker) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));
-                        Default::default()
+                        fs.worker_manager.write().queue_offline_worker(worker);
+                        return;
                     }
                     Ok(res) => res,
                 };
@@ -127,6 +158,10 @@ impl LoopTask for HeartbeatChecker {
             });
             if let Err(e) = &res {
                 warn!("{}", e);
+                self.fs
+                    .worker_manager
+                    .write()
+                    .queue_offline_worker(retry_worker);
             }
         }
 
