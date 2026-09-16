@@ -473,6 +473,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
         None,
     )?;
 
+    fs.wait_for_full_block_reconcile_for_test(0)?;
     assert_eq!(result.delete_blocks, vec![block_id]);
     Ok(())
 }
@@ -553,6 +554,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
             .find(|block| block.block.id == second.block.id)
             .expect("second block metadata should remain");
         if stale.locs.is_empty() {
+            fs.wait_for_full_block_reconcile_for_test(100)?;
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
