@@ -149,7 +149,7 @@ fn atomic_upgrade_allows_reader_and_commits_before_competing_writer() -> CommonR
             });
 
             let obsolete = FsDir::apply_reported_blocks_with_upgrade_hook(
-                fs.fs_dir.upgradable_read(),
+                &fs.fs_dir,
                 worker_id,
                 false,
                 &mut BlockReportDiagnostics::default(),
@@ -169,7 +169,7 @@ fn atomic_upgrade_allows_reader_and_commits_before_competing_writer() -> CommonR
         // A report arriving after either writer must reject the detached ID.
         // For overwrite this also removes the location awaiting worker cleanup.
         let obsolete = FsDir::apply_reported_blocks_with_upgrade(
-            fs.fs_dir.upgradable_read(),
+            &fs.fs_dir,
             worker_id,
             false,
             &mut BlockReportDiagnostics::default(),
@@ -207,8 +207,11 @@ fn atomic_upgrade_rejects_report_when_writer_discards_cache_first() -> CommonRes
                 let guard = reporter_fs_dir
                     .try_upgradable_read_for(WAIT_LIMIT)
                     .expect("report must run after the writer releases its guard");
+                // Release the timed probe before the report acquires its own guard.
+                // The sole competing writer has finished by this point.
+                drop(guard);
                 Ok(FsDir::apply_reported_blocks_with_upgrade(
-                    guard,
+                    &reporter_fs_dir,
                     worker_id,
                     false,
                     &mut BlockReportDiagnostics::default(),
@@ -244,7 +247,7 @@ fn atomic_upgrade_preserves_mixed_status_order_for_duplicate_ids() -> CommonResu
         ),
     ] {
         let obsolete = FsDir::apply_reported_blocks_with_upgrade(
-            fs.fs_dir.upgradable_read(),
+            &fs.fs_dir,
             worker_id,
             false,
             &mut BlockReportDiagnostics::default(),
@@ -280,7 +283,7 @@ fn atomic_upgrade_leaves_unknown_incremental_writing_until_authoritative_report(
             BlockLocation::with_id(worker_id),
         )])?;
         let obsolete = FsDir::apply_reported_blocks_with_upgrade(
-            fs.fs_dir.upgradable_read(),
+            &fs.fs_dir,
             worker_id,
             full_report,
             &mut BlockReportDiagnostics::default(),

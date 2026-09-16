@@ -32,7 +32,7 @@ use curvine_model::{
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
-use parking_lot::RwLockUpgradableReadGuard;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use std::collections::{HashMap, HashSet, LinkedList};
 use std::mem;
 use std::sync::Arc;
@@ -1088,7 +1088,7 @@ impl FsDir {
 
     /// Keep membership decisions protected while allowing readers during validation.
     pub(crate) fn apply_reported_blocks_with_upgrade(
-        fs_dir: RwLockUpgradableReadGuard<'_, Self>,
+        fs_dir: &RwLock<Self>,
         worker_id: u32,
         full_report: bool,
         diagnostics: &mut BlockReportDiagnostics,
@@ -1105,18 +1105,19 @@ impl FsDir {
     }
 
     fn apply_reported_blocks_with_upgrade_hook<F: FnOnce()>(
-        fs_dir: RwLockUpgradableReadGuard<'_, Self>,
+        fs_dir: &RwLock<Self>,
         worker_id: u32,
         full_report: bool,
         diagnostics: &mut BlockReportDiagnostics,
         blocks: Vec<BlockReportInfo>,
         after_prepare: F,
     ) -> FsResult<Vec<i64>> {
+        let guard = fs_dir.upgradable_read();
         let prepared =
-            fs_dir.prepare_reported_blocks(worker_id, full_report, blocks, diagnostics)?;
+            guard.prepare_reported_blocks(worker_id, full_report, blocks, diagnostics)?;
         after_prepare();
-        let mut fs_dir = RwLockUpgradableReadGuard::upgrade(fs_dir);
-        fs_dir.apply_prepared_report(prepared)
+        let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+        guard.apply_prepared_report(prepared)
     }
 
     #[cfg(test)]

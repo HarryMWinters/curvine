@@ -1324,7 +1324,7 @@ impl MasterFilesystem {
                 .collect();
             let mut chunk_diagnostics = BlockReportDiagnostics::default();
             let result = FsDir::apply_reported_blocks_with_upgrade(
-                self.fs_dir.upgradable_read(),
+                &self.fs_dir,
                 list.worker_id,
                 list.full_report,
                 &mut chunk_diagnostics,
